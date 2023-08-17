@@ -52,6 +52,10 @@ sjcl.ecc.point.prototype = {
     return this.toJac().mult2(k, this, k2, affine2).toAffine();
   },
 
+  add: function (that) {
+    return this.toJac().add(that).toAffine();
+  },
+
   multiples: function() {
     var m, i, j;
     if (this._multiples === undefined) {
@@ -75,8 +79,34 @@ sjcl.ecc.point.prototype = {
     return this.y.square().equals(this.curve.b.add(this.x.mul(this.curve.a.add(this.x.square()))));
   },
 
-  toBits: function() {
-    return sjcl.bitArray.concat(this.x.toBits(), this.y.toBits());
+  toBits: function(compressed) {
+    if (compressed === undefined) { compressed = false; }
+
+    if (this.isIdentity){
+      return new sjcl.bn().toBits(8);
+    }
+
+    if (compressed) {
+      var f = 2 | this.y.limbs[0] & 1;
+      return sjcl.bitArray.concat(new sjcl.bn(f).toBits(), this.x.toBits());
+    } else {
+      return sjcl.bitArray.concat(new sjcl.bn(4).toBits(), sjcl.bitArray.concat(this.x.toBits(), this.y.toBits()));
+    }
+  },
+
+  /**
+   * Returns true if "this" and "that" are equal.
+   */
+  equals: function(that) {
+    if (this.isIdentity) {
+      return that.isIdentity;
+    }
+
+    if (that.isIdentity) {
+      return false;
+    }
+
+    return this.x.equals(that.x) && this.y.equals(that.y);
   }
 };
 
@@ -333,14 +363,60 @@ sjcl.ecc.curve = function(Field, r, a, b, x, y) {
   this.G = new sjcl.ecc.point(this, new Field(x), new Field(y));
 };
 
-sjcl.ecc.curve.prototype.fromBits = function (bits) {
-  var w = sjcl.bitArray, l = this.field.prototype.exponent + 7 & -8,
-      p = new sjcl.ecc.point(this, this.field.fromBits(w.bitSlice(bits, 0, l)),
-                             this.field.fromBits(w.bitSlice(bits, l, 2*l)));
-  if (!p.isValid()) {
-    throw new sjcl.exception.corrupt("not on the curve!");
+sjcl.ecc.curve.prototype = {
+  fromBits: function (bits) {
+    var w = sjcl.bitArray;
+    var l = this.field.prototype.exponent + 7 & -8;
+    var f = w.extract(bits, 0, 8);
+    var p;
+
+    function recoverY(x, flag, curve) {
+      var prime = curve.field.modulus;
+      var ySquared = curve.b.add(x.mul(curve.a.add(x.square()))).mod(prime);
+      var p = prime.add(1).halveM().halveM();
+
+      var y = ySquared.powermod(p, prime);
+      if ((2 | y.limbs[0] & 1) !== flag) {
+        y = prime.sub(y).normalize();
+      }
+
+      return y;
+    }
+
+    switch(f) {
+      case 0:
+        return this.infinity();
+      case 2:
+      case 3:
+        var x = sjcl.bn.fromBits(w.bitSlice(bits, 8));
+        var y = recoverY(x, f, this);
+        p = new sjcl.ecc.point(
+            this,
+            new this.field(x),
+            new this.field(y)
+        );
+        break;
+      case 4:
+        p = new sjcl.ecc.point(
+            this,
+            this.field.fromBits(w.bitSlice(bits, 8, 8+l)),
+            this.field.fromBits(w.bitSlice(bits, 8+l, 8+2*l))
+        );
+        break;
+
+      default:
+        throw new sjcl.exception.corrupt("corrupt encoding!");
+    }
+
+    if (!p.isValid()) {
+      throw new sjcl.exception.corrupt("not on the curve!");
+    }
+    return p;
+  },
+
+  infinity: function () {
+    return new sjcl.ecc.point(this);
   }
-  return p;
 };
 
 sjcl.ecc.curves = {
@@ -603,6 +679,71 @@ sjcl.ecc.elGamal.secretKey.prototype = {
     return "elGamal";
   }
 };
+
+
+
+/** elGamal encryption keys */
+sjcl.ecc.elGamalEncryption = {
+  /** generate keys
+   * @function
+   * @param curve
+   * @param {int} paranoia Paranoia for generation (default 6)
+   * @param {secretKey} sec secret Key to use. used to get the publicKey for ones secretKey
+   */
+  generateKeys: sjcl.ecc.basicKey.generateKeys("elGamalEncryption"),
+  /** elGamal publicKey.
+   * @constructor
+   * @augments sjcl.ecc.basicKey.publicKey
+   */
+  publicKey: function (curve, point) {
+    sjcl.ecc.basicKey.publicKey.apply(this, arguments);
+  },
+  /** elGamal secretKey
+   * @constructor
+   * @augments sjcl.ecc.basicKey.secretKey
+   */
+  secretKey: function (curve, exponent) {
+    sjcl.ecc.basicKey.secretKey.apply(this, arguments);
+  }
+};
+
+sjcl.ecc.elGamalEncryption.publicKey.prototype = {
+  /** Encryption function of elGamal Public Key
+   * @param paranoia paranoia to use for randomization.
+   * @return {object} key and tag. unkem(tag) with the corresponding secret key results in the key returned.
+   */
+  encrypt: function(message, randomness, paranoia) {
+    randomness = randomness || sjcl.bn.random(this._curve.r, paranoia);
+    var r = this._curve.G.mult(randomness);
+    var c = this._point.mult(randomness);
+    c = c.add(message);
+
+    return new sjcl.ecc.elGamalEncryption.cryptogram(r, c);
+  },
+
+  getType: function() {
+    return "elGamalEncryption";
+  }
+};
+
+sjcl.ecc.elGamalEncryption.secretKey.prototype = {
+  getType: function() {
+    return "elGamalEncryption";
+  }
+};
+
+sjcl.ecc.elGamalEncryption.cryptogram = function (r, c) {
+  this.r = r;
+  this.c = c;
+};
+
+sjcl.ecc.elGamalEncryption.cryptogram.prototype = {
+  toBits: function() {
+    return { r: this.r.toBits(true),
+             c: this.c.toBits(true) };
+  }
+};
+
 
 /** ecdsa keys */
 sjcl.ecc.ecdsa = {
